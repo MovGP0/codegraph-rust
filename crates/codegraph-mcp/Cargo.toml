@@ -47,6 +47,7 @@ nix = { version = "0.31.3", features = ["fs", "process", "signal"] }
 notify = "8.2.0"
 walkdir = "2.5.0"
 regex = { workspace = true }
+quick-xml = "0.39.4"
 rapidfuzz = "0.5.0"
 tree-sitter = { workspace = true }
 scip = "0.10.0"

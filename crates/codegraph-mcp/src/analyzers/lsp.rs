@@ -36,6 +36,15 @@ pub struct LspDocumentSymbol {
 
 pub fn collect_document_symbols(symbols: &JsonValue, joiner: &str) -> Vec<LspDocumentSymbol> {
     fn walk(out: &mut Vec<LspDocumentSymbol>, v: &JsonValue, prefix: Option<&str>, joiner: &str) {
+        // Some servers wrap document symbols in a File symbol. It is not a namespace.
+        if v.get("kind").and_then(JsonValue::as_u64) == Some(1) {
+            if let Some(children) = v.get("children").and_then(JsonValue::as_array) {
+                for child in children {
+                    walk(out, child, prefix, joiner);
+                }
+            }
+            return;
+        }
         let Some(name) = v.get("name").and_then(|v| v.as_str()) else {
             return;
         };
@@ -258,6 +267,8 @@ impl LspClient {
         );
 
         let mut process = Command::new(command);
+        #[cfg(windows)]
+        process.creation_flags(0x08000000); // CREATE_NO_WINDOW
         if let Some(root) = Url::parse(root_uri)
             .ok()
             .and_then(|uri| uri.to_file_path().ok())
@@ -474,13 +485,15 @@ impl LspClient {
         let init_params = serde_json::json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
+            "workspaceFolders": [{"uri": root_uri, "name": "project"}],
             "capabilities": {
+                "general": {"positionEncodings": ["utf-16"]},
                 "textDocument": {
-                    "documentSymbol": {},
-                    "definition": {},
+                    "documentSymbol": {"hierarchicalDocumentSymbolSupport": true},
+                    "definition": {"linkSupport": true},
                     "references": {}
                 },
-                "workspace": {}
+                "workspace": {"workspaceFolders": true, "configuration": true}
             }
         });
 
@@ -711,6 +724,7 @@ pub async fn enrich_async(
             .iter()
             .filter_map(|entry| {
                 let path = Url::parse(entry.key()).ok()?.to_file_path().ok()?;
+                let path = absolute_file_path(&project_root, &path);
                 (!current.contains(&path)).then(|| entry.key().clone())
             })
             .collect();
@@ -729,12 +743,25 @@ pub async fn enrich_async(
         std::collections::HashMap::new();
     let mut nodes_by_file_line: std::collections::HashMap<(String, u32), Vec<usize>> =
         std::collections::HashMap::new();
+    let mut csharp_nodes_by_file: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let csharp_sources: std::collections::HashSet<_> = nodes
+        .iter()
+        .filter(|node| node.language == Some(codegraph_core::Language::CSharp))
+        .map(|node| node.id)
+        .collect();
     let mut files_with_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for (idx, node) in nodes.iter().enumerate() {
         let file = node.location.file_path.clone();
         let line0 = node.location.line.saturating_sub(1);
         for key in normalized_file_keys(&project_root, Path::new(&file)) {
+            if node.language == Some(codegraph_core::Language::CSharp) {
+                csharp_nodes_by_file
+                    .entry(key.clone())
+                    .or_default()
+                    .push(idx);
+            }
             nodes_by_file_line_name
                 .entry((key.clone(), line0, node.name.to_string()))
                 .or_default()
@@ -937,28 +964,63 @@ pub async fn enrich_async(
 
             // 2. Process Definitions
             for (edge_idx, def) in def_results {
+                if csharp_sources.contains(&edges[edge_idx].from) {
+                    // A compiler result must not fall back to an unrelated same-named symbol.
+                    edges[edge_idx].metadata.remove("target_node_id");
+                    edges[edge_idx]
+                        .metadata
+                        .insert("definition_status".into(), "unresolved".into());
+                }
                 let Some((target_file, target_line0, target_column)) =
                     extract_first_definition_location(&def)
                 else {
                     continue;
                 };
 
-                let candidates = nodes_by_file_line
-                    .get(&(target_file.clone(), target_line0))
-                    .or_else(|| {
-                        let relative = relative_file_key(&project_root, Path::new(&target_file))?;
-                        nodes_by_file_line.get(&(relative, target_line0))
-                    });
+                let csharp_candidates = csharp_nodes_by_file.get(&target_file).or_else(|| {
+                    let relative = relative_file_key(&project_root, Path::new(&target_file))?;
+                    csharp_nodes_by_file.get(&relative)
+                });
+                let candidates = csharp_candidates.or_else(|| {
+                    nodes_by_file_line
+                        .get(&(target_file.clone(), target_line0))
+                        .or_else(|| {
+                            let relative =
+                                relative_file_key(&project_root, Path::new(&target_file))?;
+                            nodes_by_file_line.get(&(relative, target_line0))
+                        })
+                });
                 let target_idx = candidates.and_then(|indices| {
                     let mut ranked: Vec<_> = indices
                         .iter()
                         .copied()
                         .filter(|index| {
                             let node = &nodes[*index];
+                            if matches!(
+                                edges[edge_idx]
+                                    .metadata
+                                    .get("reference_kind")
+                                    .map(String::as_str),
+                                Some("csharp_type" | "csharp_base")
+                            ) && !matches!(
+                                node.node_type,
+                                Some(
+                                    codegraph_core::NodeType::Class
+                                        | codegraph_core::NodeType::Struct
+                                        | codegraph_core::NodeType::Interface
+                                        | codegraph_core::NodeType::Enum
+                                        | codegraph_core::NodeType::Type
+                                )
+                            ) {
+                                return false;
+                            }
                             let (start, end) = utf16_columns[*index];
-                            start <= target_column
-                                && (node.location.end_line != Some(node.location.line)
-                                    || target_column <= end)
+                            let line = target_line0 + 1;
+                            let end_line = node.location.end_line.unwrap_or(node.location.line);
+                            node.location.line <= line
+                                && line <= end_line
+                                && (node.location.line != line || start <= target_column)
+                                && (end_line != line || target_column <= end)
                         })
                         .collect();
                     ranked.sort_by_key(|index| {
@@ -994,6 +1056,13 @@ pub async fn enrich_async(
                         .unwrap_or_else(|| target.name.to_string());
 
                     let edge = &mut edges[edge_idx];
+                    edge.metadata.remove("definition_status");
+                    if edge.metadata.get("reference_kind").map(String::as_str)
+                        == Some("csharp_base")
+                        && target.node_type == Some(codegraph_core::NodeType::Interface)
+                    {
+                        edge.edge_type = codegraph_core::EdgeType::Implements;
+                    }
                     edge.to = target_name;
                     edge.metadata
                         .insert("target_node_id".into(), target.id.to_string());
@@ -1235,12 +1304,243 @@ pub fn decode_one_lsp_message(buffer: &[u8]) -> Result<Option<(String, usize)>> 
 mod tests {
     use super::*;
 
+    fn python_program() -> &'static Path {
+        Path::new(if cfg!(windows) { "python" } else { "python3" })
+    }
+
+    #[tokio::test]
+    #[ignore = "requires CODEGRAPH_TEST_CSHARP_LSP and a local .NET 10 SDK"]
+    async fn roslyn_fixture_resolves_cross_file_method_calls() {
+        let server = PathBuf::from(
+            std::env::var_os("CODEGRAPH_TEST_CSHARP_LSP")
+                .expect("set the csharp-ls executable path"),
+        );
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        std::fs::write(root.join("Example.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>").unwrap();
+        let restored = tokio::process::Command::new("dotnet")
+            .args(["restore", "--source", ".", "--nologo"])
+            .current_dir(&root)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            restored.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&restored.stdout),
+            String::from_utf8_lossy(&restored.stderr)
+        );
+        let caller = root.join("Caller.cs");
+        let target = root.join("Worker.cs");
+        let caller_text = "namespace Demo;\npublic class Caller\n{\n    public void Run()\n    {\n        new Worker().Execute(1);\n    }\n}\n";
+        let target_text = "namespace Demo;\npublic interface IWorker { void Execute(int value); }\npublic class Worker : IWorker\n{\n    public void Execute(int value) {}\n}\n";
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for (path, text) in [(&caller, caller_text), (&target, target_text)] {
+            std::fs::write(path, text).unwrap();
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(
+                    &codegraph_parser::LanguageRegistry::new()
+                        .get_config(&codegraph_core::Language::CSharp)
+                        .unwrap()
+                        .language,
+                )
+                .unwrap();
+            let tree = parser.parse(text, None).unwrap();
+            let result = codegraph_parser::CSharpExtractor::extract_with_edges(
+                &tree,
+                text,
+                path.to_str().unwrap(),
+            );
+            nodes.extend(result.nodes);
+            edges.extend(result.edges);
+        }
+        let snapshots = codegraph_parser::SourceSnapshots::capture(
+            &[
+                (caller.clone(), caller_text.len() as u64),
+                (target.clone(), target_text.len() as u64),
+            ],
+            usize::MAX,
+            2,
+        )
+        .await
+        .unwrap();
+        let context = super::super::dotnet::analyze_workspace(&root, "roslyn-fixture")
+            .await
+            .unwrap();
+        assert!(context.nodes.iter().any(|node| {
+            node.metadata.attributes.get("kind").map(String::as_str) == Some("dotnet_project")
+        }));
+        let pool = LspPool::default();
+        enrich_async(
+            &pool,
+            Some(&snapshots),
+            &server,
+            &[],
+            "csharp",
+            ".",
+            true,
+            &root,
+            &[caller, target],
+            &mut nodes,
+            &mut edges,
+        )
+        .await
+        .unwrap();
+        let call = edges
+            .iter()
+            .find(|edge| edge.to == "Demo.Worker.Execute")
+            .expect("Roslyn must resolve the cross-file method");
+        assert_eq!(call.metadata["analyzer"], "lsp_definition");
+        let target = nodes
+            .iter()
+            .find(|node| node.id.to_string() == call.metadata["target_node_id"])
+            .unwrap();
+        assert_eq!(&*target.name, "Execute");
+        assert!(
+            edges.iter().any(
+                |edge| edge.edge_type == codegraph_core::EdgeType::Implements
+                    && edge.to == "Demo.IWorker"
+                    && edge.metadata.get("analyzer").map(String::as_str) == Some("lsp_definition")
+            ),
+            "Roslyn interface edges: {edges:#?}"
+        );
+        pool.clear().await;
+    }
+
+    #[tokio::test]
+    async fn csharp_definitions_resolve_overloads_across_files_at_utf16_identifiers() {
+        let project = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let caller = root.join("Caller.cs");
+        let target = root.join("Worker.cs");
+        let caller_text = "class Caller { void Run() { var text = \"😀\"; worker.Execute(1); worker.Execute(\"x\"); } }";
+        let target_text = "namespace Demo {\nclass Worker {\n[System.Obsolete]\npublic void Execute(int n) {} public void Execute(string s) {}\n}\n}";
+        std::fs::write(&caller, caller_text).unwrap();
+        std::fs::write(&target, target_text).unwrap();
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        for (path, text) in [(&caller, caller_text), (&target, target_text)] {
+            let mut parser = tree_sitter::Parser::new();
+            parser
+                .set_language(
+                    &codegraph_parser::LanguageRegistry::new()
+                        .get_config(&codegraph_core::Language::CSharp)
+                        .unwrap()
+                        .language,
+                )
+                .unwrap();
+            let tree = parser.parse(text, None).unwrap();
+            let result = codegraph_parser::CSharpExtractor::extract_with_edges(
+                &tree,
+                text,
+                path.to_str().unwrap(),
+            );
+            nodes.extend(result.nodes);
+            edges.extend(result.edges);
+        }
+        let script = root.join("roslyn_mock.py");
+        std::fs::write(&script, r#"
+import json, os, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+assert os.path.samefile(pathlib.Path.cwd(), root)
+documents = {}
+def send(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n' % len(body)).encode() + body)
+    sys.stdout.buffer.flush()
+def position(text, offset):
+    prefix = text[:offset]
+    return {'line': prefix.count('\n'), 'character': len(prefix.rsplit('\n', 1)[-1].encode('utf-16-le')) // 2}
+while True:
+    header = sys.stdin.buffer.readline()
+    if not header: break
+    length = int(header.decode().split(':')[1])
+    sys.stdin.buffer.readline()
+    message = json.loads(sys.stdin.buffer.read(length))
+    method = message.get('method')
+    params = message.get('params', {})
+    if method == 'initialize':
+        assert params['workspaceFolders'][0]['uri'] == params['rootUri']
+        assert params['capabilities']['general']['positionEncodings'] == ['utf-16']
+        send({'jsonrpc': '2.0', 'id': 'config', 'method': 'workspace/configuration', 'params': {'items': [{'section': 'csharp'}]}})
+        send({'jsonrpc': '2.0', 'id': message['id'], 'result': {'capabilities': {}}})
+    elif method == 'textDocument/didOpen':
+        assert params['textDocument']['languageId'] == 'csharp'
+        documents[params['textDocument']['uri']] = params['textDocument']['text']
+    elif method == 'textDocument/documentSymbol':
+        send({'jsonrpc': '2.0', 'id': message['id'], 'result': []})
+    elif method == 'textDocument/definition':
+        source = documents[params['textDocument']['uri']]
+        column = params['position']['character']
+        tail = source.encode('utf-16-le')[column * 2:].decode('utf-16-le')
+        assert tail.startswith('Execute'), tail
+        target = (root / 'Worker.cs').read_text()
+        start = target.index('Execute') if tail.startswith('Execute(1)') else target.rindex('Execute')
+        selection = {'start': position(target, start), 'end': position(target, start + 7)}
+        link = {'targetUri': (root / 'Worker.cs').as_uri(), 'targetRange': selection, 'targetSelectionRange': selection}
+        send({'jsonrpc': '2.0', 'id': message['id'], 'result': [link]})
+    elif 'method' not in message:
+        assert message['id'] == 'config' and message['result'] == [None]
+"#).unwrap();
+        let sources = codegraph_parser::SourceSnapshots::capture(
+            &[
+                (caller.clone(), caller_text.len() as u64),
+                (target.clone(), target_text.len() as u64),
+            ],
+            usize::MAX,
+            2,
+        )
+        .await
+        .unwrap();
+        let pool = LspPool::default();
+        let root_argument = root
+            .to_string_lossy()
+            .trim_start_matches("\\\\?\\")
+            .to_owned();
+        let stats = enrich_async(
+            &pool,
+            Some(&sources),
+            python_program(),
+            &["-u", script.to_str().unwrap(), &root_argument],
+            "csharp",
+            ".",
+            true,
+            &root,
+            &[caller, target],
+            &mut nodes,
+            &mut edges,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.edges_resolved, 2);
+        let calls: Vec<_> = edges
+            .iter()
+            .filter(|edge| edge.edge_type == codegraph_core::EdgeType::Calls)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_ne!(
+            calls[0].metadata["target_node_id"],
+            calls[1].metadata["target_node_id"]
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|edge| edge.metadata["analyzer"] == "lsp_definition")
+        );
+        pool.clear().await;
+    }
+
     #[test]
     fn ambiguous_symbol_and_definition_results_remain_unresolved() {
         assert_eq!(unique_symbol_index(&[1]), Some(1));
         assert_eq!(unique_symbol_index(&[1, 2]), None);
-        let first = serde_json::json!({"uri":"file:///tmp/a.rs", "range":{"start":{"line":0,"character":3}}});
-        let second = serde_json::json!({"uri":"file:///tmp/b.rs", "range":{"start":{"line":0,"character":3}}});
+        let project = tempfile::tempdir().unwrap();
+        let first_uri = Url::from_file_path(project.path().join("a.rs")).unwrap();
+        let second_uri = Url::from_file_path(project.path().join("b.rs")).unwrap();
+        let first = serde_json::json!({"uri":first_uri.as_str(), "range":{"start":{"line":0,"character":3}}});
+        let second = serde_json::json!({"uri":second_uri.as_str(), "range":{"start":{"line":0,"character":3}}});
         assert!(extract_first_definition_location(&serde_json::json!([first, second])).is_none());
         assert!(extract_first_definition_location(&serde_json::json!([first, first])).is_some());
     }
@@ -1262,14 +1562,14 @@ mod tests {
         let root = std::fs::canonicalize(project.path()).unwrap();
         let uri = Url::from_directory_path(&root).unwrap().to_string();
         let started = Instant::now();
-        let result = LspClient::start(Path::new("python3"), &[
+        let result = LspClient::start(python_program(), &[
             "-c",
-            "import os,sys,time; assert os.getcwd()==sys.argv[1]; sys.stderr.write('x'*16384+\"Unknown binary 'rust-analyzer'\"); sys.stderr.flush(); os.close(1); time.sleep(0.02)",
+            "import os,sys,time; assert os.path.samefile(os.getcwd(),sys.argv[1]); sys.stderr.write('x'*16384+\"Unknown binary 'rust-analyzer'\"); sys.stderr.flush(); os.close(1); time.sleep(0.02)",
             root.to_str().unwrap(),
         ], &uri).await;
         let error = result.err().expect("server should fail").to_string();
         assert!(error.contains("Unknown binary 'rust-analyzer'"), "{error}");
-        assert!(error.contains("python3"));
+        assert!(error.contains(python_program().to_str().unwrap()));
         assert!(error.len() < STDERR_TAIL_BYTES + 256);
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -1303,10 +1603,7 @@ while True:
             .to_string();
         let pool = LspPool::default();
         let args = ["-u", script.to_str().unwrap()];
-        let first = pool
-            .client(Path::new("python3"), &args, &uri)
-            .await
-            .unwrap();
+        let first = pool.client(python_program(), &args, &uri).await.unwrap();
         let started = Instant::now();
         let error = first
             .request("test/crash", JsonValue::Null)
@@ -1319,10 +1616,7 @@ while True:
         );
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(first.request("test/ping", JsonValue::Null).await.is_err());
-        let replacement = pool
-            .client(Path::new("python3"), &args, &uri)
-            .await
-            .unwrap();
+        let replacement = pool.client(python_program(), &args, &uri).await.unwrap();
         assert!(!Arc::ptr_eq(&first.next_id, &replacement.next_id));
         assert_eq!(
             replacement
@@ -1371,13 +1665,9 @@ while True:
         let uri = Url::from_directory_path(std::fs::canonicalize(project).unwrap())
             .unwrap()
             .to_string();
-        LspClient::start(
-            Path::new("python3"),
-            &["-u", script.to_str().unwrap()],
-            &uri,
-        )
-        .await
-        .unwrap()
+        LspClient::start(python_program(), &["-u", script.to_str().unwrap()], &uri)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1587,7 +1877,7 @@ while True:
             let stats = enrich_async(
                 &pool,
                 Some(&sources),
-                Path::new("python3"),
+                python_program(),
                 &args,
                 "rust",
                 "::",
@@ -1610,10 +1900,7 @@ while True:
         let uri = Url::from_directory_path(std::fs::canonicalize(dir.path()).unwrap())
             .unwrap()
             .to_string();
-        let client = pool
-            .client(Path::new("python3"), &args, &uri)
-            .await
-            .unwrap();
+        let client = pool.client(python_program(), &args, &uri).await.unwrap();
         let counts = client
             .request("test/counts", JsonValue::Null)
             .await
@@ -1630,6 +1917,13 @@ while True:
         assert_eq!(a.unwrap(), true);
         assert_eq!(b.unwrap(), true);
         pool.clear().await;
+    }
+
+    #[test]
+    fn file_symbol_wrappers_do_not_qualify_csharp_names() {
+        let symbols = serde_json::json!([{"name":"Worker.cs", "kind":1, "children":[{"name":"Demo", "kind":3, "children":[{"name":"IWorker", "kind":11, "range":{"start":{"line":1}}}]}]}]);
+        let collected = collect_document_symbols(&symbols, ".");
+        assert_eq!(collected.last().unwrap().qualified_name, "Demo.IWorker");
     }
 
     #[test]

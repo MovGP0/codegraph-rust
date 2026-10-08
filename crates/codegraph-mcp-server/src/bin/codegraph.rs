@@ -2542,7 +2542,9 @@ mod cli_command_tests {
 
 #[cfg(feature = "daemon")]
 async fn handle_daemon_stop(path: PathBuf) -> Result<()> {
+    #[cfg(unix)]
     use nix::sys::signal::{Signal, kill};
+    #[cfg(unix)]
     use nix::unistd::Pid;
 
     let project_root = std::fs::canonicalize(&path)
@@ -2559,10 +2561,17 @@ async fn handle_daemon_stop(path: PathBuf) -> Result<()> {
             );
 
             // Send SIGTERM
-            let pid = Pid::from_raw(pid as i32);
-            match kill(pid, Signal::SIGTERM) {
+            #[cfg(unix)]
+            let stop_result =
+                kill(Pid::from_raw(pid as i32), Signal::SIGTERM).map_err(anyhow::Error::from);
+            #[cfg(windows)]
+            let stop_result = ProcessManager::new()
+                .stop_server(Some(pid_path.clone()), true)
+                .await
+                .map_err(anyhow::Error::from);
+            match stop_result {
                 Ok(_) => {
-                    println!("{}", "✅ Stop signal sent successfully".green());
+                    println!("{}", "✅ Stop request sent successfully".green());
 
                     // Wait a bit and check if it stopped
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;

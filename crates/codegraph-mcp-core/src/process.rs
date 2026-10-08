@@ -1,14 +1,18 @@
 use crate::error::Result;
 use anyhow::Context;
 use dashmap::DashMap;
+#[cfg(unix)]
 use nix::sys::signal::{self, Signal};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+#[cfg(unix)]
+use tracing::warn;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone)]
 pub struct ProcessInfo {
@@ -287,6 +291,7 @@ impl ProcessManager {
         Err(anyhow::anyhow!("No running server found").into())
     }
 
+    #[cfg(unix)]
     fn is_process_running(&self, pid: u32) -> Result<bool> {
         match signal::kill(Pid::from_raw(pid as i32), None) {
             Ok(_) => Ok(true),
@@ -295,6 +300,7 @@ impl ProcessManager {
         }
     }
 
+    #[cfg(unix)]
     fn graceful_shutdown(&self, pid: u32) -> Result<()> {
         info!("Sending SIGTERM to process {}", pid);
         signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM)
@@ -314,10 +320,52 @@ impl ProcessManager {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn force_kill(&self, pid: u32) -> Result<()> {
         info!("Sending SIGKILL to process {}", pid);
         signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL)
             .context("Failed to send SIGKILL")?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn is_process_running(&self, pid: u32) -> Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{PROCESS_SYNCHRONIZE, WaitForSingleObject};
+        let Some(handle) = open_windows_process(pid, PROCESS_SYNCHRONIZE)? else {
+            return Ok(false);
+        };
+        match unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } {
+            WAIT_TIMEOUT => Ok(true),
+            WAIT_OBJECT_0 => Ok(false),
+            _ => Err(std::io::Error::last_os_error().into()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn graceful_shutdown(&self, pid: u32) -> Result<()> {
+        // Windows does not provide SIGTERM for arbitrary console processes.
+        self.force_kill(pid)
+    }
+
+    #[cfg(windows)]
+    fn force_kill(&self, pid: u32) -> Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::Threading::{
+            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        };
+        let Some(handle) = open_windows_process(pid, PROCESS_TERMINATE | PROCESS_SYNCHRONIZE)?
+        else {
+            return Ok(());
+        };
+        if unsafe { TerminateProcess(handle.as_raw_handle(), 1) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if unsafe { WaitForSingleObject(handle.as_raw_handle(), 5_000) } != WAIT_OBJECT_0 {
+            return Err(anyhow::anyhow!("Process {pid} did not stop within five seconds").into());
+        }
         Ok(())
     }
 
@@ -333,6 +381,25 @@ impl ProcessManager {
     }
 }
 
+#[cfg(windows)]
+fn open_windows_process(
+    pid: u32,
+    access: u32,
+) -> Result<Option<std::os::windows::io::OwnedHandle>> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    let handle = unsafe { OpenProcess(access, 0, pid) };
+    if handle.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+            return Ok(None);
+        }
+        return Err(error.into());
+    }
+    Ok(Some(unsafe { OwnedHandle::from_raw_handle(handle) }))
+}
+
 impl Default for ProcessManager {
     fn default() -> Self {
         Self::new()
@@ -343,6 +410,36 @@ impl Default for ProcessManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_process_status_and_stop_track_child_lifecycle() {
+        use std::os::windows::process::CommandExt;
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "process::tests::windows_child_waits_for_stop",
+                "--ignored",
+                "--exact",
+            ])
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let manager = ProcessManager::new();
+        assert!(manager.is_process_running(child.id()).unwrap());
+        manager.force_kill(child.id()).unwrap();
+        child.wait().unwrap();
+        assert!(!manager.is_process_running(child.id()).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "helper process started by the Windows lifecycle test"]
+    fn windows_child_waits_for_stop() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
 
     #[tokio::test]
     async fn test_pid_file_operations() {

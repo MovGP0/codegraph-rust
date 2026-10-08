@@ -1,50 +1,41 @@
+// ABOUTME: Extracts C# declarations and lexical reference edges from immutable syntax trees.
+// ABOUTME: Supplies precise identifier spans for Roslyn-backed LSP definition resolution.
+
 use codegraph_core::{
     CodeNode, EdgeRelationship, EdgeType, ExtractionResult, Language, Location, NodeId, NodeType,
     Span,
 };
 use std::collections::HashMap;
-use tree_sitter::{Node, Tree, TreeCursor};
+use tree_sitter::{Node, Tree};
 
-/// Advanced C# AST extractor for .NET development intelligence.
-///
-/// Extracts:
-/// - classes, interfaces, structs, records, enums
-/// - methods, properties, fields, events
-/// - async/await patterns and Task-based operations
-/// - LINQ expressions and extension methods
-/// - generics, nullable reference types
-/// - attributes and dependency injection patterns
-/// - namespace organization
-///
-/// Notes:
-/// - Optimized for modern C# (.NET 6+) patterns
-/// - Captures dependency injection and web API patterns
-/// - Handles Entity Framework and ORM patterns
-/// - Understands async/await and Task patterns
 pub struct CSharpExtractor;
 
 #[derive(Default, Clone)]
 struct CSharpContext {
-    namespace_path: Vec<String>,
-    current_class: Option<String>,
-    current_interface: Option<String>,
-    using_statements: Vec<String>,
+    namespaces: Vec<String>,
+    types: Vec<String>,
+    owner: Option<NodeId>,
+    variable_kind: Option<&'static str>,
+    in_interface: bool,
 }
 
 impl CSharpExtractor {
     pub fn extract(tree: &Tree, content: &str, file_path: &str) -> Vec<CodeNode> {
-        let mut collector = CSharpCollector::new(content, file_path);
-        let mut cursor = tree.walk();
-        collector.walk(&mut cursor, CSharpContext::default());
-        collector.into_nodes()
+        Self::extract_with_edges(tree, content, file_path).nodes
     }
 
-    /// Unified extraction of nodes AND edges in single AST traversal
     pub fn extract_with_edges(tree: &Tree, content: &str, file_path: &str) -> ExtractionResult {
-        let mut collector = CSharpCollector::new(content, file_path);
-        let mut cursor = tree.walk();
-        collector.walk(&mut cursor, CSharpContext::default());
-        collector.into_result()
+        let mut collector = CSharpCollector {
+            content,
+            file_path,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        };
+        collector.walk(tree.root_node(), CSharpContext::default());
+        ExtractionResult {
+            nodes: collector.nodes,
+            edges: collector.edges,
+        }
     }
 }
 
@@ -57,8 +48,8 @@ impl super::LanguageExtractor for CSharpExtractor {
         &[
             EdgeType::Imports,
             EdgeType::Calls,
-            EdgeType::Implements,
             EdgeType::Extends,
+            EdgeType::References,
         ]
     }
 
@@ -72,345 +63,476 @@ struct CSharpCollector<'a> {
     file_path: &'a str,
     nodes: Vec<CodeNode>,
     edges: Vec<EdgeRelationship>,
-    current_function_id: Option<NodeId>,
-    _current_class_id: Option<NodeId>,
 }
 
-impl<'a> CSharpCollector<'a> {
-    fn new(content: &'a str, file_path: &'a str) -> Self {
-        Self {
-            content,
-            file_path,
-            nodes: Vec::new(),
-            edges: Vec::new(),
-            current_function_id: None,
-            _current_class_id: None,
+impl CSharpCollector<'_> {
+    fn walk(&mut self, node: Node, mut ctx: CSharpContext) {
+        match node.kind() {
+            "compilation_unit" => {
+                // File-scoped namespaces are siblings of their members in this grammar.
+                let mut cursor = node.walk();
+                if let Some(namespace) = node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "file_scoped_namespace_declaration")
+                    .and_then(|child| child.child_by_field_name("name"))
+                {
+                    ctx.namespaces.push(self.text(namespace));
+                }
+            }
+            "namespace_declaration" | "file_scoped_namespace_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let mut namespace_ctx = ctx.clone();
+                    if node.kind() == "file_scoped_namespace_declaration" {
+                        namespace_ctx.namespaces.clear();
+                    }
+                    ctx.owner = Some(self.add_node(
+                        node,
+                        self.text(name),
+                        NodeType::Module,
+                        "namespace",
+                        &namespace_ctx,
+                    ));
+                    if node.kind() == "namespace_declaration" {
+                        ctx.namespaces.push(self.text(name));
+                    }
+                }
+            }
+            "class_declaration"
+            | "interface_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "enum_declaration"
+            | "delegate_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let kind = node.kind().trim_end_matches("_declaration");
+                    let node_type = match kind {
+                        "interface" => NodeType::Interface,
+                        "struct" => NodeType::Struct,
+                        "enum" => NodeType::Enum,
+                        "delegate" => NodeType::Type,
+                        "record" => {
+                            let mut cursor = node.walk();
+                            if node
+                                .children(&mut cursor)
+                                .any(|child| child.kind() == "struct")
+                            {
+                                NodeType::Struct
+                            } else {
+                                NodeType::Class
+                            }
+                        }
+                        _ => NodeType::Class,
+                    };
+                    let id = self.add_node(node, self.text(name), node_type, kind, &ctx);
+                    self.extract_bases(node, id);
+                    ctx.owner = Some(id);
+                    ctx.types.push(self.text(name));
+                    ctx.variable_kind = None;
+                    ctx.in_interface = node.kind() == "interface_declaration";
+                }
+            }
+            "method_declaration"
+            | "constructor_declaration"
+            | "destructor_declaration"
+            | "local_function_statement" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let kind = match node.kind() {
+                        "constructor_declaration" => "constructor",
+                        "destructor_declaration" => "destructor",
+                        "local_function_statement" => "local_function",
+                        _ => "method",
+                    };
+                    ctx.owner =
+                        Some(self.add_node(node, self.text(name), NodeType::Function, kind, &ctx));
+                    ctx.variable_kind = None;
+                }
+            }
+            "global_statement" => {
+                ctx.owner = Some(self.add_node(
+                    node,
+                    "<top-level>".into(),
+                    NodeType::Function,
+                    "top_level_statement",
+                    &ctx,
+                ));
+                ctx.variable_kind = None;
+            }
+            "property_declaration" | "event_declaration" | "enum_member_declaration" => {
+                if let Some(name) = node.child_by_field_name("name") {
+                    let kind = node.kind().trim_end_matches("_declaration");
+                    ctx.owner =
+                        Some(self.add_node(node, self.text(name), NodeType::Variable, kind, &ctx));
+                }
+            }
+            "indexer_declaration" => {
+                ctx.owner =
+                    Some(self.add_node(node, "this[]".into(), NodeType::Variable, "indexer", &ctx));
+            }
+            "operator_declaration" | "conversion_operator_declaration" => {
+                let name = node
+                    .child_by_field_name("operator")
+                    .or_else(|| node.child_by_field_name("type"))
+                    .map(|name| format!("operator {}", self.text(name)))
+                    .unwrap_or_else(|| "operator".into());
+                ctx.owner = Some(self.add_node(node, name, NodeType::Function, "operator", &ctx));
+            }
+            "field_declaration" => ctx.variable_kind = Some("field"),
+            "event_field_declaration" => ctx.variable_kind = Some("event"),
+            "variable_declarator" => {
+                if let (Some(kind), Some(name)) =
+                    (ctx.variable_kind, node.child_by_field_name("name"))
+                {
+                    ctx.owner =
+                        Some(self.add_node(node, self.text(name), NodeType::Variable, kind, &ctx));
+                    ctx.variable_kind = None;
+                }
+            }
+            "using_directive" => {
+                // `name` denotes an alias, not the imported namespace. The target is
+                // the final named child for normal, static, global and alias imports.
+                let mut cursor = node.walk();
+                if let Some(target) = node.named_children(&mut cursor).last() {
+                    let namespace = self.text(target);
+                    let id = self.add_node(
+                        node,
+                        format!("using {namespace}"),
+                        NodeType::Import,
+                        "using",
+                        &ctx,
+                    );
+                    self.edge(
+                        id,
+                        namespace.clone(),
+                        EdgeType::Imports,
+                        target,
+                        "csharp_using",
+                    );
+                    if let Some(edge) = self.edges.last_mut() {
+                        if namespace.starts_with("System") {
+                            edge.metadata.insert("framework".into(), "system".into());
+                        } else if namespace.starts_with("Microsoft") {
+                            edge.metadata.insert("framework".into(), "microsoft".into());
+                        }
+                    }
+                    if let Some(alias) = node.child_by_field_name("name") {
+                        let alias = self.text(alias);
+                        self.nodes
+                            .last_mut()
+                            .unwrap()
+                            .metadata
+                            .attributes
+                            .insert("alias".into(), alias);
+                    }
+                }
+                return;
+            }
+            "invocation_expression" => {
+                if let (Some(owner), Some(function)) =
+                    (ctx.owner, node.child_by_field_name("function"))
+                {
+                    let identifier = self.reference_token(function);
+                    self.edge(
+                        owner,
+                        self.text(function),
+                        EdgeType::Calls,
+                        identifier,
+                        "csharp_invocation",
+                    );
+                }
+            }
+            "object_creation_expression" => {
+                if let (Some(owner), Some(target)) = (ctx.owner, node.child_by_field_name("type")) {
+                    self.edge(
+                        owner,
+                        self.text(target),
+                        EdgeType::Calls,
+                        self.reference_token(target),
+                        "csharp_constructor",
+                    );
+                }
+            }
+            "member_access_expression" | "member_binding_expression" => {
+                // Calls already have an edge at the final member identifier.
+                let is_call = node.parent().is_some_and(|parent| {
+                    parent.kind() == "invocation_expression"
+                        && parent.child_by_field_name("function") == Some(node)
+                });
+                if !is_call && let Some(owner) = ctx.owner {
+                    self.edge(
+                        owner,
+                        self.text(node),
+                        EdgeType::References,
+                        self.reference_token(node),
+                        "csharp_member",
+                    );
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.walk(child, ctx.clone());
         }
     }
 
-    fn into_nodes(self) -> Vec<CodeNode> {
-        self.nodes
+    fn add_node(
+        &mut self,
+        syntax: Node,
+        name: String,
+        node_type: NodeType,
+        kind: &str,
+        ctx: &CSharpContext,
+    ) -> NodeId {
+        let mut code = CodeNode::new(
+            name.clone(),
+            Some(node_type.clone()),
+            Some(Language::CSharp),
+            Location {
+                file_path: self.file_path.into(),
+                line: syntax.start_position().row as u32 + 1,
+                column: syntax.start_position().column as u32,
+                end_line: Some(syntax.end_position().row as u32 + 1),
+                end_column: Some(syntax.end_position().column as u32),
+            },
+        )
+        .with_content(self.text(syntax));
+        code.span = Some(Self::span(syntax));
+        let attributes = &mut code.metadata.attributes;
+        attributes.insert("kind".into(), kind.into());
+        attributes.insert(
+            "qualified_name".into(),
+            ctx.namespaces
+                .iter()
+                .chain(&ctx.types)
+                .map(String::as_str)
+                .chain(std::iter::once(name.as_str()))
+                .collect::<Vec<_>>()
+                .join("."),
+        );
+        if let Some(parent) = ctx.types.last() {
+            attributes.insert("parent_class".into(), parent.clone());
+        }
+        let declaration = if syntax.kind() == "variable_declarator" {
+            syntax
+                .parent()
+                .and_then(|parent| parent.parent())
+                .unwrap_or(syntax)
+        } else {
+            syntax
+        };
+        let mut cursor = declaration.walk();
+        let modifiers: Vec<_> = declaration
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "modifier")
+            .map(|child| self.text(child))
+            .collect();
+        let access: Vec<_> = modifiers
+            .iter()
+            .map(String::as_str)
+            .filter(|modifier| matches!(*modifier, "public" | "internal" | "protected" | "private"))
+            .collect();
+        let visibility = if access.is_empty() {
+            if ctx.in_interface || kind == "enum_member" {
+                "public"
+            } else if ctx.types.is_empty() {
+                "internal"
+            } else {
+                "private"
+            }
+            .to_owned()
+        } else {
+            access.join(" ")
+        };
+        attributes.insert("visibility".into(), visibility);
+        if modifiers.iter().any(|modifier| modifier == "static") {
+            attributes.insert("static".into(), "true".into());
+        }
+        if kind == "field"
+            && (modifiers.iter().any(|modifier| modifier == "const")
+                || (modifiers.iter().any(|modifier| modifier == "static")
+                    && modifiers.iter().any(|modifier| modifier == "readonly")))
+        {
+            attributes.insert("kind".into(), "constant".into());
+            attributes.insert("const".into(), "true".into());
+        }
+        if node_type == NodeType::Function {
+            let content = self.text(syntax);
+            if modifiers.iter().any(|modifier| modifier == "async") {
+                attributes.insert("async".into(), "true".into());
+            }
+            if content.contains("Task<") {
+                attributes.insert("returns_task".into(), "true".into());
+            }
+            if [".Where(", ".Select(", ".FirstOrDefault("]
+                .iter()
+                .any(|pattern| content.contains(pattern))
+            {
+                attributes.insert("uses_linq".into(), "true".into());
+            }
+            code.complexity = Some(crate::complexity::calculate_cyclomatic_complexity(
+                &syntax,
+                self.content,
+            ));
+        }
+        if kind == "class" {
+            if name.ends_with("Controller") {
+                attributes.insert("pattern".into(), "controller".into());
+            } else if name.ends_with("Service") {
+                attributes.insert("pattern".into(), "service".into());
+            }
+        }
+        if kind == "property" {
+            let content = self.text(syntax);
+            if content.contains("{ get; set; }") {
+                attributes.insert("auto_property".into(), "true".into());
+            }
+            if content.contains("=>") {
+                attributes.insert("computed_property".into(), "true".into());
+            }
+        }
+        let id = code.id;
+        self.nodes.push(code);
+        let typed = if syntax.kind() == "variable_declarator" {
+            syntax.parent().unwrap_or(syntax)
+        } else {
+            syntax
+        };
+        for field in ["returns", "type"] {
+            if let Some(type_node) = typed.child_by_field_name(field) {
+                self.extract_type_references(type_node, id);
+            }
+        }
+        if let Some(parameters) = syntax.child_by_field_name("parameters") {
+            let mut cursor = parameters.walk();
+            for parameter in parameters.named_children(&mut cursor) {
+                if let Some(type_node) = parameter.child_by_field_name("type") {
+                    self.extract_type_references(type_node, id);
+                }
+            }
+        }
+        id
     }
 
-    fn into_result(self) -> ExtractionResult {
-        ExtractionResult {
-            nodes: self.nodes,
-            edges: self.edges,
+    fn extract_type_references(&mut self, node: Node, owner: NodeId) {
+        match node.kind() {
+            "predefined_type" | "implicit_type" => return,
+            "identifier" | "qualified_name" | "alias_qualified_name" | "generic_name" => {
+                self.edge(
+                    owner,
+                    self.text(node),
+                    EdgeType::References,
+                    self.reference_token(node),
+                    "csharp_type",
+                );
+                // Namespace qualifiers are not type arguments.
+                let simple = node.child_by_field_name("name").unwrap_or(node);
+                let mut cursor = simple.walk();
+                for child in simple
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "type_argument_list")
+                {
+                    self.extract_type_references(child, owner);
+                }
+                return;
+            }
+            "tuple_element" => {
+                if let Some(typed) = node.child_by_field_name("type") {
+                    self.extract_type_references(typed, owner);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            self.extract_type_references(child, owner);
         }
     }
 
-    fn span_for(&self, node: &Node) -> Span {
+    fn extract_bases(&mut self, node: Node, owner: NodeId) {
+        let mut cursor = node.walk();
+        for base_list in node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() == "base_list")
+        {
+            let inheritance = self.text(base_list);
+            self.nodes
+                .last_mut()
+                .unwrap()
+                .metadata
+                .attributes
+                .insert("inheritance".into(), inheritance);
+            let mut bases = base_list.walk();
+            for base in base_list
+                .named_children(&mut bases)
+                .filter(|child| child.kind() != "argument_list")
+            {
+                // Syntax alone cannot distinguish a base class from an interface.
+                // Preserve an extends edge; the resolved target carries its real kind.
+                self.edge(
+                    owner,
+                    self.text(base),
+                    EdgeType::Extends,
+                    self.reference_token(base),
+                    "csharp_base",
+                );
+            }
+        }
+    }
+
+    fn reference_token<'a>(&self, node: Node<'a>) -> Node<'a> {
+        if let Some(name) = node.child_by_field_name("name") {
+            return self.reference_token(name);
+        }
+        if node.kind() == "generic_name" {
+            let mut cursor = node.walk();
+            if let Some(identifier) = node
+                .named_children(&mut cursor)
+                .find(|child| child.kind() == "identifier")
+            {
+                return identifier;
+            }
+        }
+        // Conditional calls such as service?.Run() put the member binding last.
+        if node.kind() == "conditional_access_expression" {
+            let mut cursor = node.walk();
+            if let Some(member) = node.named_children(&mut cursor).last() {
+                return self.reference_token(member);
+            }
+        }
+        node
+    }
+
+    fn edge(
+        &mut self,
+        from: NodeId,
+        to: String,
+        edge_type: EdgeType,
+        token: Node,
+        reference_kind: &str,
+    ) {
+        self.edges.push(EdgeRelationship {
+            from,
+            to,
+            edge_type,
+            metadata: HashMap::from([
+                ("reference_kind".into(), reference_kind.into()),
+                ("source_file".into(), self.file_path.into()),
+            ]),
+            span: Some(Self::span(token)),
+        });
+    }
+
+    fn text(&self, node: Node) -> String {
+        node.utf8_text(self.content.as_bytes())
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    fn span(node: Node) -> Span {
         Span {
             start_byte: node.start_byte() as u32,
             end_byte: node.end_byte() as u32,
-        }
-    }
-
-    fn walk(&mut self, cursor: &mut TreeCursor, mut ctx: CSharpContext) {
-        let node = cursor.node();
-
-        match node.kind() {
-            // C# Namespaces
-            "namespace_declaration" => {
-                if let Some(name) = self.child_text_by_field(node, "name") {
-                    let loc = self.location(&node);
-                    let mut code = CodeNode::new(
-                        name.clone(),
-                        Some(NodeType::Module),
-                        Some(Language::CSharp),
-                        loc,
-                    )
-                    .with_content(self.node_text(&node));
-
-                    code.metadata
-                        .attributes
-                        .insert("kind".into(), "namespace".into());
-                    self.nodes.push(code);
-                    ctx.namespace_path.push(name);
-                }
-            }
-
-            // C# Classes
-            "class_declaration" => {
-                if let Some(name) = self.child_text_by_field(node, "name") {
-                    let loc = self.location(&node);
-                    let content_text = self.node_text(&node);
-                    let mut code = CodeNode::new(
-                        name.clone(),
-                        Some(NodeType::Class),
-                        Some(Language::CSharp),
-                        loc,
-                    )
-                    .with_content(content_text.clone());
-
-                    // Detect inheritance and interfaces
-                    if let Some(base_list) = self.child_text_by_field(node, "base_list") {
-                        code.metadata
-                            .attributes
-                            .insert("inheritance".into(), base_list);
-                    }
-
-                    // Detect controller pattern (ASP.NET)
-                    if name.ends_with("Controller") {
-                        code.metadata
-                            .attributes
-                            .insert("pattern".into(), "controller".into());
-                    }
-
-                    // Detect service pattern (dependency injection)
-                    if name.ends_with("Service") {
-                        code.metadata
-                            .attributes
-                            .insert("pattern".into(), "service".into());
-                    }
-
-                    code.metadata
-                        .attributes
-                        .insert("kind".into(), "class".into());
-                    self.nodes.push(code);
-                    ctx.current_class = Some(name);
-                }
-            }
-
-            // C# Interfaces
-            "interface_declaration" => {
-                if let Some(name) = self.child_text_by_field(node, "name") {
-                    let loc = self.location(&node);
-                    let mut code = CodeNode::new(
-                        name.clone(),
-                        Some(NodeType::Interface),
-                        Some(Language::CSharp),
-                        loc,
-                    )
-                    .with_content(self.node_text(&node));
-
-                    code.metadata
-                        .attributes
-                        .insert("kind".into(), "interface".into());
-                    self.nodes.push(code);
-                    ctx.current_interface = Some(name);
-                }
-            }
-
-            // C# Records (modern data structures)
-            "record_declaration" => {
-                if let Some(name) = self.child_text_by_field(node, "name") {
-                    let loc = self.location(&node);
-                    let mut code = CodeNode::new(
-                        name.clone(),
-                        Some(NodeType::Struct), // Records are value-type-like
-                        Some(Language::CSharp),
-                        loc,
-                    )
-                    .with_content(self.node_text(&node));
-
-                    code.metadata
-                        .attributes
-                        .insert("kind".into(), "record".into());
-                    self.nodes.push(code);
-                }
-            }
-
-            // C# Methods
-            "method_declaration" => {
-                if let Some(name) = self.child_text_by_field(node, "name") {
-                    let loc = self.location(&node);
-                    let content_text = self.node_text(&node);
-                    let mut code = CodeNode::new(
-                        name.clone(),
-                        Some(NodeType::Function),
-                        Some(Language::CSharp),
-                        loc,
-                    )
-                    .with_content(content_text.clone())
-                    .with_complexity(
-                        crate::complexity::calculate_cyclomatic_complexity(&node, self.content),
-                    );
-                    code.span = Some(self.span_for(&node));
-
-                    // Detect async methods
-                    if content_text.contains("async ") {
-                        code.metadata
-                            .attributes
-                            .insert("async".into(), "true".into());
-                    }
-
-                    // Detect return types
-                    if content_text.contains("Task<") {
-                        code.metadata
-                            .attributes
-                            .insert("returns_task".into(), "true".into());
-                    }
-
-                    // Detect LINQ usage
-                    if content_text.contains(".Where(")
-                        || content_text.contains(".Select(")
-                        || content_text.contains(".FirstOrDefault(")
-                    {
-                        code.metadata
-                            .attributes
-                            .insert("uses_linq".into(), "true".into());
-                    }
-
-                    code.metadata
-                        .attributes
-                        .insert("kind".into(), "method".into());
-                    if let Some(ref current_class) = ctx.current_class {
-                        code.metadata
-                            .attributes
-                            .insert("parent_class".into(), current_class.clone());
-                    }
-
-                    // Track current function for call edge attribution
-                    self.current_function_id = Some(code.id);
-                    self.nodes.push(code);
-                }
-            }
-
-            // C# Properties
-            "property_declaration" => {
-                if let Some(name) = self.child_text_by_field(node, "name") {
-                    let loc = self.location(&node);
-                    let content_text = self.node_text(&node);
-                    let mut code = CodeNode::new(
-                        name.clone(),
-                        Some(NodeType::Variable), // Properties are variable-like
-                        Some(Language::CSharp),
-                        loc,
-                    )
-                    .with_content(content_text.clone());
-
-                    // Detect auto-properties
-                    if content_text.contains("{ get; set; }") {
-                        code.metadata
-                            .attributes
-                            .insert("auto_property".into(), "true".into());
-                    }
-
-                    // Detect computed properties
-                    if content_text.contains("=>") {
-                        code.metadata
-                            .attributes
-                            .insert("computed_property".into(), "true".into());
-                    }
-
-                    code.metadata
-                        .attributes
-                        .insert("kind".into(), "property".into());
-                    self.nodes.push(code);
-                }
-            }
-
-            // C# Using statements
-            "using_directive" => {
-                if let Some(namespace) = self.child_text_by_field(node, "name") {
-                    let loc = self.location(&node);
-                    let mut code = CodeNode::new(
-                        format!("using {}", namespace),
-                        Some(NodeType::Import),
-                        Some(Language::CSharp),
-                        loc,
-                    )
-                    .with_content(self.node_text(&node));
-                    code.span = Some(self.span_for(&node));
-
-                    code.metadata
-                        .attributes
-                        .insert("kind".into(), "using".into());
-                    code.metadata
-                        .attributes
-                        .insert("namespace".into(), namespace.clone());
-
-                    // Detect common .NET namespaces
-                    let is_system = namespace.starts_with("System");
-                    let is_microsoft = namespace.starts_with("Microsoft");
-
-                    // Create import edge
-                    let edge = EdgeRelationship {
-                        from: code.id,
-                        to: namespace.clone(),
-                        edge_type: EdgeType::Imports,
-                        metadata: {
-                            let mut meta = HashMap::new();
-                            meta.insert("import_type".to_string(), "csharp_using".to_string());
-                            meta.insert("source_file".to_string(), self.file_path.to_string());
-                            if is_system {
-                                meta.insert("framework".to_string(), "system".to_string());
-                            }
-                            if is_microsoft {
-                                meta.insert("framework".to_string(), "microsoft".to_string());
-                            }
-                            meta
-                        },
-                        span: Some(self.span_for(&node)),
-                    };
-                    self.edges.push(edge);
-
-                    ctx.using_statements.push(namespace);
-                    self.nodes.push(code);
-                }
-            }
-
-            // C# Method invocations - extract call edges
-            "invocation_expression" => {
-                if let Some(current_fn) = self.current_function_id {
-                    // Extract the method being called
-                    if let Some(callee) = node.child_by_field_name("function") {
-                        let callee_name = self.node_text(&callee);
-                        if !callee_name.is_empty() {
-                            let edge = EdgeRelationship {
-                                from: current_fn,
-                                to: callee_name,
-                                edge_type: EdgeType::Calls,
-                                metadata: {
-                                    let mut meta = HashMap::new();
-                                    meta.insert(
-                                        "call_type".to_string(),
-                                        "csharp_invocation".to_string(),
-                                    );
-                                    meta
-                                },
-                                span: Some(self.span_for(&node)),
-                            };
-                            self.edges.push(edge);
-                        }
-                    }
-                }
-            }
-
-            _ => {}
-        }
-
-        // Recursively walk children
-        if cursor.goto_first_child() {
-            loop {
-                self.walk(cursor, ctx.clone());
-                if !cursor.goto_next_sibling() {
-                    break;
-                }
-            }
-            cursor.goto_parent();
-        }
-    }
-
-    fn child_text_by_field(&self, node: Node, field_name: &str) -> Option<String> {
-        node.child_by_field_name(field_name)
-            .map(|child| self.node_text(&child))
-    }
-
-    fn node_text(&self, node: &Node) -> String {
-        node.utf8_text(self.content.as_bytes())
-            .unwrap_or("")
-            .to_string()
-    }
-
-    fn location(&self, node: &Node) -> Location {
-        Location {
-            file_path: self.file_path.to_string(),
-            line: (node.start_position().row + 1) as u32,
-            column: (node.start_position().column + 1) as u32,
-            end_line: Some((node.end_position().row + 1) as u32),
-            end_column: Some((node.end_position().column + 1) as u32),
         }
     }
 }

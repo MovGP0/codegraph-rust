@@ -4,11 +4,16 @@
 use codegraph_core::{CodeNode, EdgeRelationship, NodeId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+pub(crate) fn allows_inference(edge: &EdgeRelationship) -> bool {
+    edge.metadata.get("definition_status").map(String::as_str) != Some("unresolved")
+}
+
 #[derive(Clone)]
 struct Symbol {
     id: NodeId,
     file: String,
     qualified: String,
+    is_type: bool,
 }
 
 struct LexicalCandidate {
@@ -71,6 +76,16 @@ impl SymbolCatalog {
                 Symbol {
                     id: node.id,
                     file: node.location.file_path.clone(),
+                    is_type: matches!(
+                        node.node_type,
+                        Some(
+                            codegraph_core::NodeType::Class
+                                | codegraph_core::NodeType::Struct
+                                | codegraph_core::NodeType::Interface
+                                | codegraph_core::NodeType::Enum
+                                | codegraph_core::NodeType::Type
+                        )
+                    ),
                     qualified: node
                         .metadata
                         .attributes
@@ -170,6 +185,9 @@ impl SymbolCatalog {
     }
 
     pub(crate) fn exact(&self, edge: &EdgeRelationship, variants: &[String]) -> Option<NodeId> {
+        if !allows_inference(edge) {
+            return None;
+        }
         if let Some(id) = edge
             .metadata
             .get("target_node_id")
@@ -180,12 +198,35 @@ impl SymbolCatalog {
         }
         for alias in std::iter::once(edge.to.as_str()).chain(variants.iter().map(String::as_str)) {
             if let Some(ids) = self.aliases.get(alias)
-                && let Some(id) = self.choose(ids, edge.from)
+                && let Some(id) = self.choose_for_edge(ids, edge)
             {
                 return Some(id);
             }
         }
         None
+    }
+
+    pub(crate) fn eligible_target(&self, edge: &EdgeRelationship, id: NodeId) -> bool {
+        !matches!(
+            edge.metadata.get("reference_kind").map(String::as_str),
+            Some("csharp_type" | "csharp_base")
+        ) || self.symbols.get(&id).is_some_and(|symbol| symbol.is_type)
+    }
+
+    fn choose_for_edge(&self, ids: &[NodeId], edge: &EdgeRelationship) -> Option<NodeId> {
+        if matches!(
+            edge.metadata.get("reference_kind").map(String::as_str),
+            Some("csharp_type" | "csharp_base")
+        ) {
+            let eligible: Vec<_> = ids
+                .iter()
+                .copied()
+                .filter(|id| self.eligible_target(edge, *id))
+                .collect();
+            self.choose(&eligible, edge.from)
+        } else {
+            self.choose(ids, edge.from)
+        }
     }
 
     /// A deterministic shortlist; a zero limit retains every overlapping candidate.
@@ -215,6 +256,9 @@ impl SymbolCatalog {
     }
 
     pub(crate) fn fuzzy(&self, edge: &EdgeRelationship) -> Option<(NodeId, f64)> {
+        if !allows_inference(edge) {
+            return None;
+        }
         let target = edge.to.to_lowercase();
         let target_length = target.chars().count();
         let scorer = rapidfuzz::distance::levenshtein::BatchComparator::new(target.chars());
@@ -239,7 +283,7 @@ impl SymbolCatalog {
             if score < best {
                 continue;
             }
-            let Some(id) = self.choose(&self.aliases[&candidate.alias], edge.from) else {
+            let Some(id) = self.choose_for_edge(&self.aliases[&candidate.alias], edge) else {
                 continue;
             };
             if score > best {
@@ -308,6 +352,36 @@ mod tests {
                 .insert("target_node_id".into(), a.id.to_string());
             assert_eq!(catalog.exact(&direct, &[]), Some(a.id));
         }
+    }
+
+    #[test]
+    fn csharp_type_positions_exclude_same_named_members() {
+        let mut class = node("types.cs", "Widget");
+        class.node_type = Some(NodeType::Class);
+        let property = node("caller.cs", "Widget");
+        let catalog = SymbolCatalog::new(&[class.clone(), property.clone()]);
+        let mut reference = edge(property.id, "Widget");
+        reference
+            .metadata
+            .insert("reference_kind".into(), "csharp_type".into());
+        assert_eq!(catalog.exact(&reference, &[]), Some(class.id));
+        assert_eq!(catalog.fuzzy(&reference).map(|(id, _)| id), Some(class.id));
+        let members_only = SymbolCatalog::new(&[property]);
+        assert_eq!(members_only.exact(&reference, &[]), None);
+        assert_eq!(members_only.fuzzy(&reference), None);
+    }
+
+    #[test]
+    fn unmapped_compiler_definitions_do_not_bind_to_same_named_symbols() {
+        let target = node("unrelated.cs", "Task");
+        let catalog = SymbolCatalog::new(std::slice::from_ref(&target));
+        let mut reference = edge(target.id, "Task");
+        reference
+            .metadata
+            .insert("definition_status".into(), "unresolved".into());
+        assert_eq!(catalog.exact(&reference, &[]), None);
+        assert_eq!(catalog.fuzzy(&reference), None);
+        assert!(!allows_inference(&reference));
     }
 
     #[test]

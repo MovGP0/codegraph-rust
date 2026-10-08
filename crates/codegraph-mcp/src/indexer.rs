@@ -739,6 +739,9 @@ impl ProjectIndexer {
                 "CODEGRAPH_EMBEDDING_SKIP_CHUNKING",
                 "CODEGRAPH_ANALYZERS",
                 "CODEGRAPH_ANALYZERS_REQUIRE_TOOLS",
+                "CODEGRAPH_CSHARP_SOLUTION",
+                "CODEGRAPH_DOTNET_CONFIGURATION",
+                "CODEGRAPH_DOTNET_TARGET_FRAMEWORK",
                 "CODEGRAPH_PROJECT_ID",
                 "CODEGRAPH_ORGANIZATION_ID",
                 "CODEGRAPH_REPOSITORY_URL",
@@ -786,7 +789,7 @@ impl ProjectIndexer {
             let make_fingerprint =
                 |external_support: &std::collections::BTreeMap<String, String>| {
                     fingerprint(&(
-                        "project-input-v7",
+                        "project-input-v8-csharp",
                         &self.project_id,
                         source_snapshots
                             .iter()
@@ -908,13 +911,41 @@ impl ProjectIndexer {
                 analyzer_settings.architecture
             );
 
+            let dotnet_workspace = support.keys().any(|path| {
+                let path = Path::new(path);
+                codegraph_parser::file_collect::is_msbuild_project_path(path)
+                    || matches!(
+                        path.extension().and_then(|extension| extension.to_str()),
+                        Some("sln" | "slnx")
+                    )
+            });
             let build_context_task = if analyzer_settings.build_context
-                && analyzer_languages.contains(&codegraph_core::Language::Rust)
+                && (analyzer_languages.contains(&codegraph_core::Language::Rust)
+                    || dotnet_workspace)
             {
                 let root = self.project_root.clone();
                 let project = self.project_id.clone();
-                Some(tokio::task::spawn_blocking(move || {
-                    crate::analyzers::build_context::analyze_cargo_workspace(&root, &project)
+                let rust = analyzer_languages.contains(&codegraph_core::Language::Rust);
+                Some(tokio::spawn(async move {
+                    let mut output = if rust {
+                        let root = root.clone();
+                        let project = project.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::analyzers::build_context::analyze_cargo_workspace(
+                                &root, &project,
+                            )
+                        })
+                        .await??
+                    } else {
+                        crate::analyzers::build_context::BuildContextOutput::default()
+                    };
+                    if dotnet_workspace {
+                        let dotnet =
+                            crate::analyzers::dotnet::analyze_workspace(&root, &project).await?;
+                        output.nodes.extend(dotnet.nodes);
+                        output.edges.extend(dotnet.edges);
+                    }
+                    Ok::<_, anyhow::Error>(output)
                 }))
             } else {
                 None
@@ -934,7 +965,7 @@ impl ProjectIndexer {
             // Clone files for parsing (we need them again for metadata persistence)
             let ast_cache = codegraph_core::artifact_cache::ArtifactCache::new(
                 self.project_root.join(".codegraph/index-cache"),
-                "unified-ast-v4",
+                "unified-ast-v5-csharp",
             );
             let parse_start = std::time::Instant::now();
             let (mut nodes, mut edges, pstats) = crate::estimation::parse_snapshots_with_cache(
@@ -1124,6 +1155,8 @@ impl ProjectIndexer {
                 for (_, (spec, mut files)) in grouped {
                     files.sort();
                     files.dedup();
+                    let server_args = crate::analyzers::lsp_arguments(&spec, &project_root)?;
+                    let server_args: Vec<_> = server_args.iter().map(String::as_str).collect();
                     let candidates =
                         crate::analyzers::find_tool_candidates_on_path(spec.tool_name, &path_env);
                     if candidates.is_empty() {
@@ -1139,7 +1172,7 @@ impl ProjectIndexer {
                             &self.lsp_pool,
                             Some(&source_snapshots),
                             &tool,
-                            spec.args,
+                            &server_args,
                             spec.language_id,
                             spec.name_joiner,
                             analyzer_settings.lsp_definitions_enabled(),
@@ -1873,7 +1906,10 @@ impl ProjectIndexer {
                 if target.is_some() {
                     exact_count += 1;
                 }
-                if target.is_none() && !catalog.ambiguous(&edge.to) {
+                if target.is_none()
+                    && !catalog.ambiguous(&edge.to)
+                    && crate::resolution::allows_inference(edge)
+                {
                     let lexical = *lexical_cache
                         .entry((edge.from, edge.to.clone()))
                         .or_insert_with(|| catalog.fuzzy(edge));
@@ -1902,6 +1938,7 @@ impl ProjectIndexer {
                     let mut candidate_symbols = HashMap::new();
                     for (edge, target) in edges.iter().zip(&targets) {
                         if target.is_some()
+                            || !crate::resolution::allows_inference(edge)
                             || catalog.ambiguous(&edge.to)
                             || Self::semantic_stop_symbol(&edge.to)
                         {
@@ -1980,7 +2017,9 @@ impl ProjectIndexer {
                         let semantic_targets = scoring.targets;
                         for (index, (edge, target)) in edges.iter().zip(&mut targets).enumerate() {
                             if target.is_none()
+                                && crate::resolution::allows_inference(edge)
                                 && let Some((id, score)) = semantic_targets.get(&edge.to).copied()
+                                && catalog.eligible_target(edge, id)
                             {
                                 *target = Some(id);
                                 resolution_provenance[index] = ("semantic", score as f64);

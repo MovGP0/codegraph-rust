@@ -101,8 +101,9 @@ pub(crate) fn external_input_fingerprints(
         root.join(".codegraph/index-cache"),
         "cargo-metadata-v1",
     );
-    let previous: std::collections::BTreeMap<String, String> =
+    let mut previous: std::collections::BTreeMap<String, String> =
         cache.get("external-inputs").unwrap_or_default();
+    previous.extend(super::dotnet::external_inputs(root));
     previous
         .keys()
         .map(|path| {

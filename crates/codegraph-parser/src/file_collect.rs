@@ -73,6 +73,9 @@ pub fn collect_source_files_with_config(
         if entry.depth() == 0 || !entry.file_type().is_some_and(|kind| kind.is_dir()) {
             return true;
         }
+        if is_dotnet_build_directory(entry.path()) {
+            return false;
+        }
         // Appending a component also matches patterns such as **/target/** at the
         // directory itself, so the walker never visits its descendants.
         !directory_excludes
@@ -184,6 +187,31 @@ where
     if added { builder.build().ok() } else { None }
 }
 
+/// Do not hide Rust's src/bin or an ordinary source directory named bin.
+pub fn is_dotnet_build_directory(path: &Path) -> bool {
+    if !path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("bin") || name.eq_ignore_ascii_case("obj"))
+    {
+        return false;
+    }
+    path.parent()
+        .and_then(|parent| std::fs::read_dir(parent).ok())
+        .is_some_and(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .any(|entry| is_msbuild_project_path(&entry.path()))
+        })
+}
+
+/// MSBuild project types include managed, native, shared and SDK-specific projects.
+pub fn is_msbuild_project_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.to_ascii_lowercase().ends_with("proj"))
+}
+
 /// Get supported file extensions for specified languages
 fn get_supported_extensions(languages: &[String]) -> HashSet<&'static str> {
     let mut extensions = HashSet::new();
@@ -276,6 +304,39 @@ pub fn collect_source_files(dir: &Path) -> Result<Vec<(PathBuf, u64)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn csharp_collection_excludes_dotnet_build_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in [
+            "App/Main.cs",
+            "App/obj/Debug/Generated.cs",
+            "App/bin/Copy.cs",
+            "App/App.csproj",
+        ] {
+            let path = dir.path().join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "class Example {}\n").unwrap();
+        }
+        let files = collect_source_files_with_config(
+            dir.path(),
+            &FileCollectionConfig {
+                languages: vec!["csharp".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, dir.path().join("App/Main.cs"));
+    }
+
+    #[test]
+    fn dotnet_build_exclusions_preserve_rust_bin_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src/bin")).unwrap();
+        std::fs::write(dir.path().join("src/bin/tool.rs"), "fn main() {}\n").unwrap();
+        assert_eq!(collect_source_files(dir.path()).unwrap().len(), 1);
+    }
 
     #[test]
     fn auto_detection_prunes_generated_directories_and_unsupported_files() {

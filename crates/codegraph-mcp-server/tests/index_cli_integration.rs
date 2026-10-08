@@ -30,6 +30,117 @@ fn offline_index_command(root: &Path, config: &Path) -> Command {
     command
 }
 
+#[test]
+fn dotnet_solution_only_index_keeps_mixed_project_context() {
+    if !Command::new("dotnet")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("SKIP: dotnet SDK is not available for the offline mixed-solution fixture");
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path();
+    let config = root.join("providers.toml");
+    codegraph_core::config_manager::ConfigManager::create_default_config(&config).unwrap();
+    for (name, text) in [
+        (
+            "App.csproj",
+            "<Project><ItemGroup><ProjectReference Include=\"Lib.fsproj\" /></ItemGroup></Project>",
+        ),
+        ("Lib.fsproj", "<Project />"),
+        (
+            "Legacy.vbproj",
+            "<Project><ItemGroup><ProjectReference Include=\"Lib.fsproj\" /></ItemGroup></Project>",
+        ),
+        (
+            "Native.vcxproj",
+            "<Project><Import Project=\"UnavailableCppSdk.props\" /></Project>",
+        ),
+        (
+            "Mixed.slnx",
+            "<Solution><Project Path=\"App.csproj\" /><Project Path=\"Lib.fsproj\" /><Project Path=\"Legacy.vbproj\" /><Project Path=\"Native.vcxproj\" /></Solution>",
+        ),
+    ] {
+        std::fs::write(root.join(name), text).unwrap();
+    }
+    let output = offline_index_command(root, &config)
+        .args([
+            "index",
+            ".",
+            "--index-tier",
+            "balanced",
+            "--stats-json",
+            "stats.json",
+        ])
+        .env_remove("CODEGRAPH_ANALYZERS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats: Value =
+        serde_json::from_slice(&std::fs::read(root.join("stats.json")).unwrap()).unwrap();
+    assert_eq!(stats["complete"], true);
+    assert_eq!(stats["files"], 0);
+    assert_eq!(stats["build_context_nodes"], 5);
+    assert_eq!(stats["build_context_edges"], 6);
+}
+
+#[test]
+fn csharp_fast_index_needs_no_roslyn_or_msbuild_and_skips_generated_outputs() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    let config = root.join("providers.toml");
+    codegraph_core::config_manager::ConfigManager::create_default_config(&config).unwrap();
+    for (name, contents) in [
+        (
+            "App/Main.cs",
+            "namespace Demo; public class App { public void Run() {} }",
+        ),
+        ("App/obj/Generated.cs", "class Generated {}"),
+        ("App/bin/Copy.cs", "class Copied {}"),
+        (
+            "App/App.csproj",
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup></Project>",
+        ),
+    ] {
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    let output = offline_index_command(root, &config)
+        .args([
+            "index",
+            ".",
+            "--languages",
+            "csharp",
+            "--index-tier",
+            "fast",
+            "--stats-json",
+            "stats.json",
+        ])
+        .env_remove("CODEGRAPH_ANALYZERS")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stats: Value =
+        serde_json::from_slice(&std::fs::read(root.join("stats.json")).unwrap()).unwrap();
+    assert_eq!(stats["files"], 1);
+    assert_eq!(stats["complete"], true);
+    assert_eq!(stats["build_context_nodes"], 0);
+    assert!(stats["nodes"].as_u64().unwrap() >= 3);
+}
+
 fn index_files(traversal: Option<&str>, root_source: bool) -> usize {
     let project = tempfile::tempdir().unwrap();
     let root = project.path();

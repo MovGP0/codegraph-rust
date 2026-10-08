@@ -1015,6 +1015,7 @@ dependencies = [
  "num_cpus",
  "parking_lot",
  "protobuf",
+ "quick-xml",
  "rapidfuzz",
  "rayon",
  "regex",
@@ -1071,6 +1072,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

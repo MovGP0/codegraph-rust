@@ -8,6 +8,7 @@ pub mod architecture;
 pub mod build_context;
 pub mod dataflow;
 pub mod docs_contracts;
+pub mod dotnet;
 pub mod enrichment;
 pub mod lsp;
 pub mod module_linker;
@@ -178,6 +179,12 @@ pub fn lsp_server_for_language(language: &Language) -> Option<LspServerSpec> {
             language_id: "cpp",
             name_joiner: "::",
         }),
+        Language::CSharp => Some(LspServerSpec {
+            tool_name: "csharp-ls",
+            args: &[],
+            language_id: "csharp",
+            name_joiner: ".",
+        }),
         _ => None,
     }
 }
@@ -223,6 +230,16 @@ pub fn required_tools_for_languages(languages: &[Language]) -> Vec<RequiredTool>
                 name: "clangd",
                 language: Language::Cpp,
             }),
+            Language::CSharp => {
+                out.push(RequiredTool {
+                    name: "csharp-ls",
+                    language: Language::CSharp,
+                });
+                out.push(RequiredTool {
+                    name: "dotnet",
+                    language: Language::CSharp,
+                });
+            }
             _ => {}
         }
     }
@@ -230,6 +247,29 @@ pub fn required_tools_for_languages(languages: &[Language]) -> Vec<RequiredTool>
     out.sort_by(|a, b| a.name.cmp(b.name));
     out.dedup_by(|a, b| a.name == b.name);
     out
+}
+
+/// Select an explicit solution when a C# workspace has more than one solution.
+pub fn lsp_arguments(spec: &LspServerSpec, root: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let mut args: Vec<_> = spec.args.iter().map(|arg| (*arg).to_owned()).collect();
+    if spec.language_id == "csharp"
+        && let Some(solution) = std::env::var_os("CODEGRAPH_CSHARP_SOLUTION")
+    {
+        let solution = root.join(solution);
+        let solution = std::fs::canonicalize(&solution).map_err(|error| {
+            anyhow::anyhow!(
+                "Cannot open CODEGRAPH_CSHARP_SOLUTION {}: {error}",
+                solution.display()
+            )
+        })?;
+        anyhow::ensure!(
+            solution.is_file(),
+            "C# solution must be a file: {}",
+            solution.display()
+        );
+        args.extend(["--solution".into(), solution.to_string_lossy().into_owned()]);
+    }
+    Ok(args)
 }
 
 pub fn find_tool_on_path(tool: &str, path_env: &str) -> Option<PathBuf> {
@@ -279,6 +319,16 @@ mod tests {
     fn required_tools_include_rust_analyzer_for_rust() {
         let tools = required_tools_for_languages(&[Language::Rust]);
         assert!(tools.iter().any(|t| t.name == "rust-analyzer"));
+    }
+
+    #[test]
+    fn csharp_uses_roslyn_language_server_and_requires_its_tool() {
+        let spec = lsp_server_for_language(&Language::CSharp).unwrap();
+        assert_eq!(spec.tool_name, "csharp-ls");
+        assert_eq!(spec.language_id, "csharp");
+        assert_eq!(spec.name_joiner, ".");
+        let tools = required_tools_for_languages(&[Language::CSharp]);
+        assert!(tools.iter().any(|tool| tool.name == "csharp-ls"));
     }
 
     #[test]
